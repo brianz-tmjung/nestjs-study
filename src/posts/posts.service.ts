@@ -1,43 +1,51 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { QueryRunner, Repository } from 'typeorm';
+import { promises } from 'fs';
+import { basename, join } from 'path';
+import { PostsModel } from '../common/entity/posts.entity';
+import { PostImage } from '../common/entity/image.entity';
+import { CreatePostDto } from './dto/create-post.dto';
+import { CreatePostImageDto } from './dto/create-post-image.dto';
+import { DEFAULT_POSTS_FIND_OPTIONS } from './const/default-posts-find-options.const';
 
-export interface PostModel {
-  id: number;
-  author: string;
-  title: string;
-  content: string;
-  likeCount: number;
-  commentCount: number;
-}
-
-let posts: PostModel[] = [
-  {
-    id: 1,
-    author: 'mj',
-    title: '뉴진스',
-    content: '메이크업',
-    likeCount: 1000,
-    commentCount: 4,
-  },
-  {
-    id: 2,
-    author: 'mj2',
-    title: '뉴진스2',
-    content: '메이크업3',
-    likeCount: 10040,
-    commentCount: 42,
-  },
-];
+const TEMP_forder_path = join(process.cwd(), 'uploads', 'temp');
+const POSTS_forder_path = join(process.cwd(), 'uploads', 'posts');
 
 @Injectable()
 export class PostsService {
+  constructor(
+    @InjectRepository(PostsModel)
+    private readonly postsRepository: Repository<PostsModel>,
+    @InjectRepository(PostImage)
+    private readonly postImageRepository: Repository<PostImage>,
+  ) { }
+
+  // queryRunner가 있으면 트랜잭션에 묶인 repository를, 없으면 일반 repository를 반환
+  // → 모든 메서드에서 분기 로직 중복 제거
+  private getRepository(qr?: QueryRunner): Repository<PostsModel> {
+    return qr
+      ? qr.manager.getRepository<PostsModel>(PostsModel)
+      : this.postsRepository;
+  }
+
+  private getPostImageRepository(qr?: QueryRunner): Repository<PostImage> {
+    return qr
+      ? qr.manager.getRepository<PostImage>(PostImage)
+      : this.postImageRepository;
+  }
+
   // 1) GET /posts
-  getAllPosts(): PostModel[] {
-    return posts;
+  async getAllPosts() {
+    return this.postsRepository.find(DEFAULT_POSTS_FIND_OPTIONS);
   }
 
   // 2) GET /posts/:id
-  getPostById(id: number): PostModel {
-    const post = posts.find((post) => post.id === id);
+  async getPostById(id: number) {
+    const post = await this.postsRepository.findOne({
+      ...DEFAULT_POSTS_FIND_OPTIONS,
+      where: { id },
+    });
     if (!post) {
       throw new NotFoundException();
     }
@@ -45,52 +53,83 @@ export class PostsService {
   }
 
   // 3) POST /posts
-  createPost(author: string, title: string, content: string): PostModel {
-    const post: PostModel = {
-      id: posts[posts.length - 1].id + 1,
-      author,
-      title,
-      content,
+  // 게시글만 생성 (이미지는 createPostImage에서 별도 처리하므로 dto.images는 무시)
+  async createPost(authorId: number, dto: CreatePostDto, qr?: QueryRunner) {
+    const repository = this.getRepository(qr);
+
+    const post = repository.create({
+      title: dto.title,
+      content: dto.content,
+      authorId,
       likeCount: 0,
       commentCount: 0,
-    };
-    posts = [...posts, post];
-    return post;
+    });
+    return repository.save(post);
+  }
+
+  // 3-1) POST /posts/image
+  // 원칙: DB 작업(rollback 가능) → 파일 이동(rollback 불가) 순서
+  // → DB에서 에러가 나면 파일이 아직 옮겨지지 않았으므로 깨끗한 상태 유지
+  async createPostImage(dto: CreatePostImageDto, qr?: QueryRunner) {
+    const fileName = basename(dto.path); //path travesal 시도 차단용
+    const tempPath = join(TEMP_forder_path, fileName);
+    const finalPath = join(POSTS_forder_path, fileName);
+
+    // 1) 비-DB 검증: temp 파일 존재 확인 (read only, 안전)
+    try {
+      await promises.access(tempPath);
+    } catch {
+      throw new BadRequestException('이미지 없');
+    }
+
+    // 2) DB 작업 먼저 (실패 시 throw → 파일 이동 안 됨)
+    const repository = this.getPostImageRepository(qr);
+
+    const result = await repository.save(
+      repository.create({
+        ...dto,
+        path: fileName,
+      }),
+    );
+
+    // 3) 파일 이동 (DB 저장 성공 후의 마지막 단계 — irreversible)
+    await promises.mkdir(POSTS_forder_path, { recursive: true });
+    await promises.rename(tempPath, finalPath);
+
+    return result;
   }
 
   // 4) PUT /posts/:id
-  updatePost(
+  async updatePost(
     id: number,
     author?: string,
     title?: string,
     content?: string,
-  ): PostModel {
-    const post = posts.find((post) => post.id === id);
-    if (post) {
-      if (author) post.author = author;
-      if (title) post.title = title;
-      if (content) post.content = content;
-      return post;
+  ) {
+    const post = await this.postsRepository.findOne({
+      ...DEFAULT_POSTS_FIND_OPTIONS,
+      where: { id },
+    });
+    if (!post) {
+      throw new NotFoundException();
     }
-    const newPost: PostModel = {
-      id,
-      author: author ?? '',
-      title: title ?? '',
-      content: content ?? '',
-      likeCount: 0,
-      commentCount: 0,
-    };
-    posts.push(newPost);
+    const updatedPost = this.postsRepository.create({
+      ...post,
+      ...(author && { author }),
+      ...(title && { title }),
+      ...(content && { content }),
+    });
+    const newPost = this.postsRepository.save(updatedPost);
     return newPost;
   }
 
   // 5) DELETE /posts/:id
-  deletePost(id: number): { id: number } {
-    const index = posts.findIndex((post) => post.id === id);
-    if (index === -1) {
+  async deletePost(id: number) {
+    const post = await this.postsRepository.findOne({ where: { id } });
+    if (!post) {
       throw new NotFoundException();
     }
-    posts.splice(index, 1);
+    await this.postsRepository.remove(post);
     return { id };
   }
 }
