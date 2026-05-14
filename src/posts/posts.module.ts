@@ -35,4 +35,4 @@ import { PostImage } from '../common/entity/image.entity';
   controllers: [PostsController],
   providers: [PostsService],
 })
-export class PostsModule { }
+export class PostsModule {}

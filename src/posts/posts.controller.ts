@@ -11,19 +11,17 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
+import type { QueryRunner as TypeOrmQueryRunner } from 'typeorm';
 import { basename } from 'path';
 import { PostsService } from './posts.service';
 import { CreatePostDto } from './dto/create-post.dto';
 import { ImageModelType } from '../common/entity/image.entity';
+import { TransactionInterceptor } from '../common/interceptor/transaction.interceptor';
+import { QueryRunner } from '../common/decorator/query-runner.decorator';
 
 @Controller('posts')
 export class PostsController {
-  constructor(
-    private readonly postsService: PostsService,
-    @InjectDataSource() private readonly dataSource: DataSource,
-  ) { }
+  constructor(private readonly postsService: PostsService) {}
 
   // 1) GET /posts
   // 모든 post를 다 가져온다
@@ -41,47 +39,36 @@ export class PostsController {
 
   // 3) POST /posts
   // 새로운 post를 생성한다
+  // @UseInterceptors(TransactionInterceptor): commit/rollback/release를 자동 처리
+  // @QueryRunner: 인터셉터가 부착한 트랜잭션 qr을 주입받음
   @Post()
+  @UseInterceptors(TransactionInterceptor)
   async postPost(
     @Body('authorId', ParseIntPipe) authorId: number,
     @Body() body: CreatePostDto,
+    @QueryRunner() qr: TypeOrmQueryRunner,
   ) {
     // 1) 비-DB 작업: 파일명 정제 (../ 같은 path traversal 시도 차단)
     const images: string[] = body.images?.map((name) => basename(name)) ?? [];
 
-    // 2) 트랜잭션 시작
-    const qr = this.dataSource.createQueryRunner();
-    //쿼리 러너를 연결한다
-    //이시점 부턴 트랜잭션 안에서 데이터베이스 액션을 시작할수잇다
-    await qr.connect();
-    //시작
-    await qr.startTransaction();
+    // 2) 게시글 생성 (qr로 트랜잭션에 묶임)
+    const post = await this.postsService.createPost(authorId, body, qr);
 
-    try {
-      // 2-1) 게시글 생성
-      const post = await this.postsService.createPost(authorId, body, qr);
-
-      // 2-2) 이미지마다 createPostImage 호출 (post 연결, order 부여)
-      for (let i = 0; i < images.length; i++) {
-        await this.postsService.createPostImage(
-          {
-            post,
-            order: i,
-            path: images[i],
-            type: ImageModelType.POST_IMAGE,
-          },
-          qr,
-        );
-      }
-
-      await qr.commitTransaction(); // 모든 작업 성공 시 커밋
-      return this.postsService.getPostById(post.id);
-    } catch (err) {
-      await qr.rollbackTransaction(); // 실패 시 전체 취소
-      throw err;
-    } finally {
-      await qr.release(); // 커넥션 반환
+    // 3) 이미지마다 createPostImage 호출 (post 연결, order 부여)
+    for (let i = 0; i < images.length; i++) {
+      await this.postsService.createPostImage(
+        {
+          post,
+          order: i,
+          path: images[i],
+          type: ImageModelType.POST_IMAGE,
+        },
+        qr,
+      );
     }
+
+    // commit/rollback은 인터셉터가 자동 처리
+    return this.postsService.getPostById(post.id);
   }
 
   // 3-1) POST /posts/image
